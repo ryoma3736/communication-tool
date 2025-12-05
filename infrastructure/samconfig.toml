@@ -1,0 +1,17 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "lark-message-hub"
+resolve_s3 = true
+s3_prefix = "lark-message-hub"
+region = "ap-northeast-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+
+[staging.deploy.parameters]
+stack_name = "lark-message-hub-staging"
+parameter_overrides = "Environment=staging"
+
+[production.deploy.parameters]
+stack_name = "lark-message-hub-production"
+parameter_overrides = "Environment=production"

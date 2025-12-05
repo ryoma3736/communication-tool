@@ -1,0 +1,336 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Communication Tool - Lark Message Hub
+
+##############################################################################
+# Parameters
+##############################################################################
+
+Parameters:
+  Environment:
+    Type: String
+    Default: staging
+    AllowedValues:
+      - staging
+      - production
+    Description: Deployment environment
+
+  NodeVersion:
+    Type: String
+    Default: '20.x'
+    Description: Node.js runtime version
+
+  Version:
+    Type: String
+    Default: '0.1.0'
+    Description: Application version
+
+##############################################################################
+# Globals
+##############################################################################
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: nodejs20.x
+    Tracing: Active
+    Environment:
+      Variables:
+        NODE_ENV: !Ref Environment
+        LOG_LEVEL: info
+        POWERTOOLS_SERVICE_NAME: communication-tool
+        POWERTOOLS_METRICS_NAMESPACE: communication-tool
+    Tags:
+      Environment: !Ref Environment
+      Project: communication-tool
+      Version: !Ref Version
+
+##############################################################################
+# Resources
+##############################################################################
+
+Resources:
+  ##########################################################################
+  # API Gateway
+  ##########################################################################
+
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'communication-tool-${Environment}'
+      StageName: !Ref Environment
+      TracingEnabled: true
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,PATCH,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Request-Id'"
+        AllowOrigin: "'*'"
+        MaxAge: "'600'"
+      Auth:
+        ApiKeyRequired: false
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '$context.requestId $context.extendedRequestId $context.identity.sourceIp $context.requestTime $context.httpMethod $context.routeKey $context.status $context.protocol $context.responseLength'
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/communication-tool-${Environment}'
+      RetentionInDays: 30
+
+  ##########################################################################
+  # Lambda Functions
+  ##########################################################################
+
+  MainFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'communication-tool-main-${Environment}'
+      CodeUri: dist/
+      Handler: index.handler
+      Description: Main application handler for Communication Tool
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DataTable
+          TWILIO_ACCOUNT_SID: !Sub '{{resolve:secretsmanager:${TwilioSecrets}:SecretString:TWILIO_ACCOUNT_SID}}'
+          TWILIO_AUTH_TOKEN: !Sub '{{resolve:secretsmanager:${TwilioSecrets}:SecretString:TWILIO_AUTH_TOKEN}}'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+        - CloudWatchPutMetricPolicy: {}
+        - XRayDaemonWriteAccess
+      Events:
+        RootApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /
+            Method: GET
+        ProxyApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /{proxy+}
+            Method: ANY
+
+  MainFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${MainFunction}'
+      RetentionInDays: 30
+
+  ##########################################################################
+  # Health Check Function
+  ##########################################################################
+
+  HealthCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'communication-tool-health-${Environment}'
+      InlineCode: |
+        exports.handler = async (event) => {
+          return {
+            statusCode: 200,
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*'
+            },
+            body: JSON.stringify({
+              status: 'healthy',
+              timestamp: new Date().toISOString(),
+              environment: process.env.NODE_ENV,
+              version: process.env.VERSION
+            })
+          };
+        };
+      Handler: index.handler
+      Environment:
+        Variables:
+          VERSION: !Ref Version
+      Events:
+        HealthApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /health
+            Method: GET
+
+  HealthCheckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${HealthCheckFunction}'
+      RetentionInDays: 7
+
+  ##########################################################################
+  # DynamoDB Tables
+  ##########################################################################
+
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'communication-tool-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: UserIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: communication-tool
+
+  ##########################################################################
+  # Secrets Manager
+  ##########################################################################
+
+  TwilioSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'communication-tool/twilio/${Environment}'
+      Description: Twilio credentials for Communication Tool
+      SecretString: !Sub |
+        {
+          "TWILIO_ACCOUNT_SID": "REPLACE_WITH_ACTUAL_SID",
+          "TWILIO_AUTH_TOKEN": "REPLACE_WITH_ACTUAL_TOKEN"
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: communication-tool
+
+  ##########################################################################
+  # CloudWatch Alarms
+  ##########################################################################
+
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'communication-tool-api-5xx-${Environment}'
+      AlarmDescription: Alert on API Gateway 5xx errors
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub 'communication-tool-${Environment}'
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'communication-tool-lambda-errors-${Environment}'
+      AlarmDescription: Alert on Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MainFunction
+
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'communication-tool-lambda-throttles-${Environment}'
+      AlarmDescription: Alert on Lambda function throttles
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MainFunction
+
+##############################################################################
+# Conditions
+##############################################################################
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+##############################################################################
+# Outputs
+##############################################################################
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  ApiId:
+    Description: API Gateway ID
+    Value: !Ref ApiGateway
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiId'
+
+  FunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt MainFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionArn'
+
+  FunctionName:
+    Description: Lambda Function Name
+    Value: !Ref MainFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionName'
+
+  TableName:
+    Description: DynamoDB Table Name
+    Value: !Ref DataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+
+  TableArn:
+    Description: DynamoDB Table ARN
+    Value: !GetAtt DataTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TableArn'
+
+  HealthCheckEndpoint:
+    Description: Health check endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/health'
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheckEndpoint'

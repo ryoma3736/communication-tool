@@ -1,0 +1,372 @@
+name: Infrastructure Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'template.yaml'
+      - 'infrastructure/**'
+      - '.github/workflows/infrastructure.yml'
+  pull_request:
+    paths:
+      - 'template.yaml'
+      - 'infrastructure/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - deploy
+          - validate
+          - preview
+          - delete
+
+env:
+  AWS_REGION: us-east-1
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate:
+    name: Validate CloudFormation Template
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Validate SAM template
+        run: |
+          if [ -f template.yaml ]; then
+            sam validate --lint
+            echo "✅ Template validation successful"
+          else
+            echo "⚠️ No template.yaml found, creating skeleton..."
+            cat > template.yaml << 'EOF'
+          AWSTemplateFormatVersion: '2010-09-09'
+          Transform: AWS::Serverless-2016-10-31
+          Description: Communication Tool - Lark Message Hub
+
+          Parameters:
+            Environment:
+              Type: String
+              Default: staging
+              AllowedValues:
+                - staging
+                - production
+              Description: Deployment environment
+
+            NodeVersion:
+              Type: String
+              Default: '20.x'
+              Description: Node.js runtime version
+
+          Globals:
+            Function:
+              Timeout: 30
+              MemorySize: 256
+              Runtime: nodejs20.x
+              Tracing: Active
+              Environment:
+                Variables:
+                  NODE_ENV: !Ref Environment
+                  LOG_LEVEL: info
+
+          Resources:
+            # API Gateway
+            ApiGateway:
+              Type: AWS::Serverless::Api
+              Properties:
+                StageName: !Ref Environment
+                TracingEnabled: true
+                Cors:
+                  AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+                  AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+                  AllowOrigin: "'*'"
+
+            # Lambda Functions
+            MainFunction:
+              Type: AWS::Serverless::Function
+              Properties:
+                CodeUri: dist/
+                Handler: index.handler
+                Events:
+                  ApiEvent:
+                    Type: Api
+                    Properties:
+                      RestApiId: !Ref ApiGateway
+                      Path: /
+                      Method: ANY
+
+            # DynamoDB Table (if needed)
+            DataTable:
+              Type: AWS::DynamoDB::Table
+              Properties:
+                TableName: !Sub 'communication-tool-${Environment}'
+                BillingMode: PAY_PER_REQUEST
+                AttributeDefinitions:
+                  - AttributeName: id
+                    AttributeType: S
+                KeySchema:
+                  - AttributeName: id
+                    KeyType: HASH
+                StreamSpecification:
+                  StreamViewType: NEW_AND_OLD_IMAGES
+                Tags:
+                  - Key: Environment
+                    Value: !Ref Environment
+                  - Key: Project
+                    Value: communication-tool
+
+          Outputs:
+            ApiEndpoint:
+              Description: API Gateway endpoint URL
+              Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/'
+              Export:
+                Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+            FunctionArn:
+              Description: Lambda Function ARN
+              Value: !GetAtt MainFunction.Arn
+              Export:
+                Name: !Sub '${AWS::StackName}-FunctionArn'
+
+            TableName:
+              Description: DynamoDB Table Name
+              Value: !Ref DataTable
+              Export:
+                Name: !Sub '${AWS::StackName}-TableName'
+          EOF
+            echo "Created template.yaml skeleton"
+          fi
+
+      - name: Lint template with cfn-lint
+        run: |
+          pip install cfn-lint
+          cfn-lint template.yaml || echo "⚠️ Linting warnings found"
+
+      - name: Upload template artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudformation-template
+          path: template.yaml
+
+  preview-staging:
+    name: Preview Changes (Staging)
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.action == 'preview' && inputs.environment == 'staging')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download template
+        uses: actions/download-artifact@v4
+        with:
+          name: cloudformation-template
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Generate changeset
+        id: changeset
+        run: |
+          sam deploy \
+            --stack-name communication-tool-staging \
+            --s3-bucket ${{ secrets.SAM_DEPLOYMENT_BUCKET_STAGING }} \
+            --region ${{ env.AWS_REGION }} \
+            --parameter-overrides Environment=staging \
+            --no-execute-changeset \
+            --capabilities CAPABILITY_IAM \
+            2>&1 | tee changeset-output.txt
+
+          CHANGESET_NAME=$(grep -oP 'arn:aws:cloudformation.*changeset/[^/]+' changeset-output.txt | tail -1)
+          echo "changeset_arn=$CHANGESET_NAME" >> $GITHUB_OUTPUT
+
+      - name: Describe changeset
+        if: steps.changeset.outputs.changeset_arn != ''
+        run: |
+          aws cloudformation describe-change-set \
+            --change-set-name ${{ steps.changeset.outputs.changeset_arn }} \
+            --query 'Changes[*].[ResourceChange.Action,ResourceChange.LogicalResourceId,ResourceChange.ResourceType]' \
+            --output table
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('changeset-output.txt', 'utf8');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## 🔄 Infrastructure Changes Preview (Staging)
+
+              <details>
+              <summary>CloudFormation Changeset</summary>
+
+              \`\`\`
+              ${output}
+              \`\`\`
+
+              </details>
+
+              ⚠️ Review these changes before merging.
+              `
+            });
+
+  deploy-staging:
+    name: Deploy Infrastructure (Staging)
+    runs-on: ubuntu-latest
+    needs: validate
+    if: |
+      github.event_name == 'push' && github.ref == 'refs/heads/main' ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'deploy' && inputs.environment == 'staging')
+    environment:
+      name: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download template
+        uses: actions/download-artifact@v4
+        with:
+          name: cloudformation-template
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Deploy infrastructure
+        run: |
+          sam deploy \
+            --stack-name communication-tool-staging \
+            --s3-bucket ${{ secrets.SAM_DEPLOYMENT_BUCKET_STAGING }} \
+            --s3-prefix infrastructure-staging \
+            --region ${{ env.AWS_REGION }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --parameter-overrides \
+              Environment=staging \
+              NodeVersion=20.x \
+            --no-fail-on-empty-changeset \
+            --tags \
+              Environment=staging \
+              Project=communication-tool \
+              ManagedBy=github-actions
+
+      - name: Get stack outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name communication-tool-staging \
+            --query 'Stacks[0].Outputs' \
+            --output table
+
+  deploy-production:
+    name: Deploy Infrastructure (Production)
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'deploy' && inputs.environment == 'production'
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download template
+        uses: actions/download-artifact@v4
+        with:
+          name: cloudformation-template
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PRODUCTION }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Deploy infrastructure
+        run: |
+          sam deploy \
+            --stack-name communication-tool-production \
+            --s3-bucket ${{ secrets.SAM_DEPLOYMENT_BUCKET_PRODUCTION }} \
+            --s3-prefix infrastructure-production \
+            --region ${{ env.AWS_REGION }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --parameter-overrides \
+              Environment=production \
+              NodeVersion=20.x \
+            --no-fail-on-empty-changeset \
+            --tags \
+              Environment=production \
+              Project=communication-tool \
+              ManagedBy=github-actions
+
+      - name: Get stack outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name communication-tool-production \
+            --query 'Stacks[0].Outputs' \
+            --output table
+
+  delete-stack:
+    name: Delete Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'delete'
+    environment:
+      name: ${{ inputs.environment }}-deletion
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.environment == 'production' && secrets.AWS_ROLE_ARN_PRODUCTION || secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete stack
+        run: |
+          STACK_NAME="communication-tool-${{ inputs.environment }}"
+          echo "⚠️ Deleting stack: $STACK_NAME"
+
+          aws cloudformation delete-stack --stack-name $STACK_NAME
+
+          echo "Waiting for stack deletion..."
+          aws cloudformation wait stack-delete-complete --stack-name $STACK_NAME
+
+          echo "✅ Stack deleted successfully"

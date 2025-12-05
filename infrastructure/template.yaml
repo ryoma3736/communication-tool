@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Lark Message Hub - Multi-channel Communication Platform
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        CUSTOMERS_TABLE: !Ref CustomersTable
+        THREADS_TABLE: !Ref ThreadsTable
+        MESSAGES_TABLE: !Ref MessagesTable
+        LARK_APP_ID: !Ref LarkAppId
+        LARK_APP_SECRET: !Ref LarkAppSecret
+
+Parameters:
+  Environment:
+    Type: String
+    Default: staging
+  LarkAppId:
+    Type: String
+    NoEcho: true
+  LarkAppSecret:
+    Type: String
+    NoEcho: true
+  TwilioAccountSid:
+    Type: String
+    NoEcho: true
+  TwilioAuthToken:
+    Type: String
+    NoEcho: true
+
+Resources:
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub lark-message-hub-${Environment}
+      StageName: !Ref Environment
+      Cors:
+        AllowOrigin: "'*'"
+        AllowMethods: "'POST,OPTIONS'"
+
+  InboundMessageHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub lark-hub-inbound-${Environment}
+      CodeUri: ../dist/handlers/
+      Handler: inbound.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CustomersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ThreadsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTable
+      Events:
+        TwilioWebhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /webhook/twilio
+            Method: POST
+        MetaWebhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /webhook/meta
+            Method: POST
+        LinkedInWebhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /webhook/linkedin
+            Method: POST
+        EmailWebhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /webhook/email
+            Method: POST
+
+  OutboundMessageHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub lark-hub-outbound-${Environment}
+      CodeUri: ../dist/handlers/
+      Handler: outbound.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ThreadsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTable
+      Events:
+        LarkWebhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /webhook/lark
+            Method: POST
+
+  CustomersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub lark-hub-customers-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: identifier_type
+          AttributeType: S
+        - AttributeName: identifier_value
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: identifier-index
+          KeySchema:
+            - AttributeName: identifier_type
+              KeyType: HASH
+            - AttributeName: identifier_value
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ThreadsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub lark-hub-threads-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: thread_id
+          AttributeType: S
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: updated_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: thread_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: customer-index
+          KeySchema:
+            - AttributeName: customer_id
+              KeyType: HASH
+            - AttributeName: updated_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: updated_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub lark-hub-messages-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: message_id
+          AttributeType: S
+        - AttributeName: thread_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: message_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: thread-index
+          KeySchema:
+            - AttributeName: thread_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+Outputs:
+  ApiEndpoint:
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
